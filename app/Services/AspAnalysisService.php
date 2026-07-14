@@ -2,143 +2,348 @@
 
 namespace App\Services;
 
+use App\Services\Ai\AiServiceManager;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * AspAnalysisService
+ *
+ * Orchestrates all AI analysis tasks.
+ * - Text analysis → Deepseek (fast, cheap, structured JSON)
+ * - Vision/OCR   → OpenAI GPT-4o (if key provided), else mock
+ *
+ * All methods include a graceful 3-tier fallback:
+ *   1. Real Deepseek/OpenAI API
+ *   2. Curated fixture response (if API fails)
+ *   3. Static mock JSON (last resort)
+ */
 class AspAnalysisService
 {
-    /**
-     * Simulate an LLM call to analyze a single product based on product-analysis-schema.md
-     */
-    public function analyzeProduct(string $productName, array $userProfile, array $skinScores)
-    {
-        // In a real implementation, this would build a prompt using system-prompt.md
-        // and call OpenAI/Anthropic APIs. For the hackathon, we return the exact
-        // schema required by product-analysis-schema.md.
+    public function __construct(private readonly AiServiceManager $ai) {}
 
-        return [
-            "product" => [
-                "brand" => "Mocked Brand",
-                "product_name" => $productName,
-                "category" => "serum",
-                "variant" => null,
-                "confidence" => 0.95,
-                "needs_user_confirmation" => false
-            ],
-            "label_facts" => [
-                "visible_ingredients" => ["Niacinamide", "Zinc PCA", "Water"],
-                "claims_on_label" => ["oil-free", "brightening"],
-                "spf_value" => null
-            ],
-            "ingredient_facts" => [
-                "ingredients" => [
-                    [
-                        "input" => "Niacinamide",
-                        "canonical_name" => "Niacinamide",
-                        "functions" => ["brightening", "barrier-support"],
-                        "flags" => [],
-                        "matched" => true
-                    ]
-                ],
-                "hero_ingredients" => ["Niacinamide", "Zinc PCA"],
-                "has_fragrance" => false,
-                "has_alcohol" => false,
-                "pregnancy_safe" => true
-            ],
-            "skinsaver_opinion" => [
-                "summary" => "A great serum for controlling oil and brightening skin.",
-                "routine_slot" => "serum",
-                "benefit_tags" => ["brightening", "oil-control"],
-                "conflicts" => [], // Empty means no conflict
-                "pros" => ["Controls sebum", "Fades dark spots", "Affordable"],
-                "cons" => ["Can be drying if overused"],
-                "decision" => "buy",
-                "reason" => "Matches your oily skin profile perfectly without conflicts.",
-                "fit_score" => 92,
-                "cheaper_alternative_query" => "cheap niacinamide serum",
-                "medical_claim_guardrail_ok" => true
-            ]
-        ];
+    // ─── System Prompts ──────────────────────────────────────────────────────
+
+    private string $complianceRule = <<<'RULE'
+IMPORTANT COMPLIANCE RULES (FDA & medical):
+- Never claim to diagnose, treat, or cure any skin condition.
+- Use language like "visual observation", "looks like", "may suggest".
+- Always include a medical disclaimer in your response.
+- All claims must be about cosmetic benefits, NOT medical outcomes.
+RULE;
+
+    private function productAnalysisSystemPrompt(): string
+    {
+        return <<<PROMPT
+You are SkinSaver AI, a cosmetic ingredient expert and shopping assistant.
+Your job is to analyze skincare/beauty products and evaluate them for a specific user profile.
+{$this->complianceRule}
+You must respond with valid JSON following this exact schema:
+{
+  "product": { "brand": "", "product_name": "", "category": "", "confidence": 0.9 },
+  "ingredient_facts": {
+    "hero_ingredients": [],
+    "has_fragrance": false,
+    "has_alcohol": false,
+    "pregnancy_safe": true
+  },
+  "skinsaver_opinion": {
+    "summary": "",
+    "decision": "buy|skip|wait|replace",
+    "reason": "",
+    "fit_score": 85,
+    "pros": [],
+    "cons": [],
+    "conflicts": [],
+    "medical_claim_guardrail_ok": true
+  }
+}
+PROMPT;
+    }
+
+    private function wishlistSystemPrompt(): string
+    {
+        return <<<PROMPT
+You are SkinSaver AI, a beauty shopping copilot. Analyze a wishlist of skincare products for a user.
+{$this->complianceRule}
+Return valid JSON with this exact structure:
+{
+  "buy": [{"product": "", "reason": ""}],
+  "wait": [{"product": "", "reason": ""}],
+  "skip": [{"product": "", "reason": ""}],
+  "replace": [{"product": "", "alternative": "", "reason": ""}],
+  "scores": {
+    "wishlist_fit": 85,
+    "budget_efficiency": 80,
+    "duplicate_risk": "low",
+    "irritation_risk": "low"
+  },
+  "estimated_savings": "Rp 100.000 - Rp 200.000"
+}
+PROMPT;
+    }
+
+    private function premiumRoutineSystemPrompt(): string
+    {
+        return <<<PROMPT
+You are SkinSaver AI. Build a personalized AM/PM skincare routine and find cheaper alternatives.
+{$this->complianceRule}
+Return valid JSON with this exact structure:
+{
+  "routine": {
+    "am": [{"step": 1, "type": "Cleanser", "product": "", "price": "", "usage": "Daily"}],
+    "pm": [{"step": 1, "type": "Cleanser", "product": "", "price": "", "usage": "Daily"}]
+  },
+  "alternatives": [
+    {
+      "original": {"name": "", "price": ""},
+      "alternative": {"name": "", "price": "", "fit": 90, "saving": ""},
+      "reason": ""
+    }
+  ],
+  "budget_summary": {"total_cost": "", "efficiency_score": 90},
+  "medical_disclaimer": "This report is generated by AI based on cosmetic ingredient databases. It is not medical advice. Patch test all new products before full application."
+}
+PROMPT;
+    }
+
+    private function ingredientOcrSystemPrompt(): string
+    {
+        return <<<PROMPT
+You are a cosmetic ingredient reader. The user has provided an image of the back of a skincare/cosmetic product packaging.
+Extract the ingredients list from the image and identify any potentially harmful or beneficial ingredients.
+{$this->complianceRule}
+Return valid JSON with this exact structure:
+{
+  "product_name_detected": "",
+  "ingredients_raw": "full raw ingredients text from image",
+  "ingredients_parsed": [
+    {"name": "", "function": "", "flag": "safe|caution|avoid", "reason": ""}
+  ],
+  "warnings": ["Any ingredient conflict or caution"],
+  "overall_safety": "safe|caution|avoid",
+  "summary": "Brief cosmetic safety summary"
+}
+PROMPT;
+    }
+
+    // ─── Public Methods ──────────────────────────────────────────────────────
+
+    public function analyzeProduct(string $productName, array $userProfile, array $skinScores): array
+    {
+        $skinType    = $userProfile['skin_type'] ?? 'combination';
+        $concerns    = implode(', ', $userProfile['concerns'] ?? ['general']);
+        $budgetTier  = $userProfile['budget_tier'] ?? 'medium';
+
+        $userPrompt = <<<PROMPT
+Analyze this product for this user:
+- Product: {$productName}
+- Skin type: {$skinType}
+- Concerns: {$concerns}
+- Budget: {$budgetTier}
+- Skin scores: oiliness={$skinScores['oiliness']}, hydration={$skinScores['hydration']}
+PROMPT;
+
+        try {
+            return $this->ai->driver()->completeJson($this->productAnalysisSystemPrompt(), $userPrompt);
+        } catch (\Throwable $e) {
+            Log::error('[AspAnalysisService] analyzeProduct failed', ['error' => $e->getMessage()]);
+            return $this->mockProductAnalysis($productName);
+        }
+    }
+
+    public function auditWishlist(array $products, array $userProfile, array $skinScores, string $budget): array
+    {
+        $productList = implode("\n- ", $products);
+        $skinType    = $userProfile['skin_type'] ?? 'combination';
+        $concerns    = implode(', ', $userProfile['concerns'] ?? []);
+
+        $userPrompt = <<<PROMPT
+Audit this wishlist for the user:
+Products:
+- {$productList}
+
+User profile:
+- Skin type: {$skinType}
+- Concerns: {$concerns}
+- Budget: {$budget}
+PROMPT;
+
+        try {
+            return $this->ai->driver()->completeJson($this->wishlistSystemPrompt(), $userPrompt);
+        } catch (\Throwable $e) {
+            Log::error('[AspAnalysisService] auditWishlist failed', ['error' => $e->getMessage()]);
+            return $this->mockWishlistAudit($products);
+        }
+    }
+
+    public function buildPremiumRoutine(array $profile, array $skinScores, array $wishlist): array
+    {
+        $skinType   = $profile['skin_type'] ?? 'combination';
+        $concerns   = implode(', ', $profile['concerns'] ?? []);
+        $budgetTier = $profile['budget_tier'] ?? 'medium';
+        $wishStr    = implode(', ', $wishlist);
+
+        $userPrompt = <<<PROMPT
+Build a personalized AM/PM skincare routine and find cheaper alternatives.
+User:
+- Skin type: {$skinType}
+- Concerns: {$concerns}
+- Budget: {$budgetTier}
+- Current wishlist: {$wishStr}
+PROMPT;
+
+        try {
+            return $this->ai->driver()->completeJson($this->premiumRoutineSystemPrompt(), $userPrompt);
+        } catch (\Throwable $e) {
+            Log::error('[AspAnalysisService] buildPremiumRoutine failed', ['error' => $e->getMessage()]);
+            return $this->mockPremiumRoutine();
+        }
     }
 
     /**
-     * Simulate an LLM call to audit an entire wishlist based on api.md schema
+     * Scan ingredient image using Vision API (OpenAI GPT-4o),
+     * then analyze safety with Deepseek.
      */
-    public function auditWishlist(array $products, array $userProfile, array $skinScores, string $budget)
+    public function scanIngredients(string $imageBase64, string $mimeType, array $userProfile): array
     {
-        // Mocked response aligning exactly with api.md > POST /asp/audit-wishlist
-        
-        $buy = [];
-        $wait = [];
-        $skip = [];
-        $replace = [];
-        
-        // Distribute the requested products into categories
-        foreach ($products as $i => $product) {
-            if ($i === 0) {
-                $buy[] = ["product" => $product, "reason" => "Essential gap filled for hydration."];
-            } elseif ($i === 1) {
-                $wait[] = ["product" => $product, "reason" => "Good but not urgent, prioritize basics first."];
-            } else {
-                $skip[] = ["product" => $product, "reason" => "Conflicts with your current sensitive skin condition."];
+        $skinType   = $userProfile['skin_type'] ?? 'combination';
+        $concerns   = implode(', ', $userProfile['concerns'] ?? []);
+
+        // Step 1: OCR with Vision driver
+        $visionDriver  = $this->ai->visionDriver();
+        $visionPrompt  = "Extract all visible ingredient information from this cosmetic packaging image.";
+
+        $ocrText = null;
+        if ($visionDriver->supportsVision()) {
+            $ocrText = $visionDriver->completeVision(
+                $this->ingredientOcrSystemPrompt(),
+                $visionPrompt,
+                $imageBase64,
+                $mimeType
+            );
+        }
+
+        // Step 2: If OCR returned raw JSON, decode; otherwise send OCR text to Deepseek for analysis
+        if ($ocrText) {
+            $cleaned = preg_replace('/^```(?:json)?\s*/i', '', trim($ocrText));
+            $cleaned = preg_replace('/\s*```$/', '', $cleaned);
+            try {
+                $parsed = json_decode($cleaned, true, 512, JSON_THROW_ON_ERROR);
+                // Enrich with user-specific safety analysis via Deepseek
+                return $this->enrichWithUserSafety($parsed, $skinType, $concerns);
+            } catch (\Throwable) {
+                // OCR returned text, not JSON — send to Deepseek for structured analysis
+                return $this->analyzeIngredientText($ocrText, $skinType, $concerns);
             }
         }
-        
-        // If wishlist is empty, provide defaults
-        if (empty($products)) {
-            $buy[] = ["product" => "Beauty of Joseon Sunscreen", "reason" => "Essential daily protection gap."];
-            $wait[] = ["product" => "COSRX Snail Mucin", "reason" => "Good for texture but not urgent."];
-        }
 
+        // Fallback: no vision API available, use mock
+        Log::warning('[AspAnalysisService] No vision driver available, returning mock ingredient scan.');
+        return $this->mockIngredientScan();
+    }
+
+    // ─── Private Helpers ─────────────────────────────────────────────────────
+
+    private function enrichWithUserSafety(array $ocrResult, string $skinType, string $concerns): array
+    {
+        $ingredientsList = $ocrResult['ingredients_raw'] ?? implode(', ', array_column($ocrResult['ingredients_parsed'] ?? [], 'name'));
+
+        $userPrompt = <<<PROMPT
+The following ingredients were detected on a cosmetic product:
+{$ingredientsList}
+
+Evaluate safety for:
+- Skin type: {$skinType}
+- Concerns: {$concerns}
+
+Flag each ingredient as safe, caution, or avoid. Return JSON matching the ingredientOcr schema.
+PROMPT;
+
+        try {
+            $deepseekResult = $this->ai->driver()->completeJson($this->ingredientOcrSystemPrompt(), $userPrompt);
+            // Merge: keep detected product name from OCR, use Deepseek analysis
+            return array_merge($ocrResult, $deepseekResult);
+        } catch (\Throwable $e) {
+            Log::error('[AspAnalysisService] enrichWithUserSafety failed', ['error' => $e->getMessage()]);
+            return $ocrResult;
+        }
+    }
+
+    private function analyzeIngredientText(string $text, string $skinType, string $concerns): array
+    {
+        $userPrompt = "Analyze these ingredients for {$skinType} skin with concerns: {$concerns}.\n\nIngredients text:\n{$text}";
+        try {
+            return $this->ai->driver()->completeJson($this->ingredientOcrSystemPrompt(), $userPrompt);
+        } catch (\Throwable $e) {
+            Log::error('[AspAnalysisService] analyzeIngredientText failed', ['error' => $e->getMessage()]);
+            return $this->mockIngredientScan();
+        }
+    }
+
+    // ─── Mock Fallbacks ───────────────────────────────────────────────────────
+
+    private function mockProductAnalysis(string $productName): array
+    {
         return [
-            "buy" => $buy,
-            "wait" => $wait,
-            "skip" => $skip,
-            "replace" => $replace,
-            "scores" => [
-                "wishlist_fit" => rand(60, 95),
-                "budget_efficiency" => rand(50, 90),
-                "duplicate_risk" => "low",
-                "irritation_risk" => "low"
-            ],
-            "estimated_savings" => "Rp100.000 - Rp250.000"
+            'product'          => ['brand' => 'Unknown', 'product_name' => $productName, 'category' => 'serum', 'confidence' => 0.7],
+            'ingredient_facts' => ['hero_ingredients' => ['Niacinamide'], 'has_fragrance' => false, 'has_alcohol' => false, 'pregnancy_safe' => true],
+            'skinsaver_opinion' => ['summary' => 'Demo mode — connect Deepseek API for real analysis.', 'decision' => 'wait', 'reason' => 'AI not configured.', 'fit_score' => 70, 'pros' => [], 'cons' => [], 'conflicts' => [], 'medical_claim_guardrail_ok' => true],
         ];
     }
 
-    /**
-     * Simulate an LLM call to generate a premium AM/PM routine and alternative products
-     */
-    public function buildPremiumRoutine(array $profile, array $skinScores, array $wishlist)
+    private function mockWishlistAudit(array $products): array
     {
-        // Mocked response aligning with price-rules.md, alternative-products.md, and frontend phase 7
+        $buy = array_slice($products, 0, 1);
+        $wait = array_slice($products, 1, 1);
+        $skip = array_slice($products, 2);
+
         return [
-            "routine" => [
-                "am" => [
-                    ["step" => 1, "type" => "Cleanser", "product" => "CeraVe Hydrating Cleanser", "price" => "$11.49", "usage" => "Daily"],
-                    ["step" => 2, "type" => "Serum", "product" => "The Ordinary Niacinamide 10% + Zinc 1%", "price" => "$6.50", "usage" => "Daily"],
-                    ["step" => 3, "type" => "Moisturizer", "product" => "Neutrogena Hydro Boost Gel Cream", "price" => "$14.99", "usage" => "Daily"],
-                    ["step" => 4, "type" => "Sunscreen", "product" => "Beauty of Joseon Relief Sun SPF 50+", "price" => "$13.00", "usage" => "Daily"]
+            'buy'              => array_map(fn ($p) => ['product' => $p, 'reason' => 'Demo: Essential gap filler.'], $buy),
+            'wait'             => array_map(fn ($p) => ['product' => $p, 'reason' => 'Demo: Good but not urgent.'], $wait),
+            'skip'             => array_map(fn ($p) => ['product' => $p, 'reason' => 'Demo: May conflict.'], $skip),
+            'replace'          => [],
+            'scores'           => ['wishlist_fit' => 80, 'budget_efficiency' => 75, 'duplicate_risk' => 'low', 'irritation_risk' => 'low'],
+            'estimated_savings' => 'Rp 100.000 - Rp 250.000',
+        ];
+    }
+
+    private function mockPremiumRoutine(): array
+    {
+        return [
+            'routine' => [
+                'am' => [
+                    ['step' => 1, 'type' => 'Cleanser',    'product' => 'CeraVe Hydrating Cleanser',       'price' => '$11.49', 'usage' => 'Daily'],
+                    ['step' => 2, 'type' => 'Serum',       'product' => 'The Ordinary Niacinamide 10%',   'price' => '$6.50',  'usage' => 'Daily'],
+                    ['step' => 3, 'type' => 'Moisturizer', 'product' => 'Neutrogena Hydro Boost',         'price' => '$14.99', 'usage' => 'Daily'],
+                    ['step' => 4, 'type' => 'Sunscreen',   'product' => 'Beauty of Joseon SPF 50+',       'price' => '$13.00', 'usage' => 'Daily'],
                 ],
-                "pm" => [
-                    ["step" => 1, "type" => "Cleanser", "product" => "CeraVe Hydrating Cleanser", "price" => "$11.49", "usage" => "Daily"],
-                    ["step" => 2, "type" => "Treatment", "product" => "The Ordinary Granactive Retinoid 2%", "price" => "$8.90", "usage" => "2-3x / week"],
-                    ["step" => 3, "type" => "Moisturizer", "product" => "Neutrogena Hydro Boost Gel Cream", "price" => "$14.99", "usage" => "Daily"]
-                ]
-            ],
-            "alternatives" => [
-                [
-                    "original" => ["name" => "Paula's Choice 2% BHA", "price" => "$34.00"],
-                    "alternative" => ["name" => "COSRX BHA Blackhead Power Liquid", "price" => "$16.00", "fit" => 92, "saving" => "$18.00"],
-                    "reason" => "Same active ingredient (BHA) at effective concentration, gentler formulation."
+                'pm' => [
+                    ['step' => 1, 'type' => 'Cleanser',    'product' => 'CeraVe Hydrating Cleanser',      'price' => '$11.49', 'usage' => 'Daily'],
+                    ['step' => 2, 'type' => 'Treatment',   'product' => 'The Ordinary Granactive Retinoid', 'price' => '$8.90', 'usage' => '2-3x/week'],
+                    ['step' => 3, 'type' => 'Moisturizer', 'product' => 'Neutrogena Hydro Boost',         'price' => '$14.99', 'usage' => 'Daily'],
                 ],
-                [
-                    "original" => ["name" => "Tatcha The Water Cream", "price" => "$72.00"],
-                    "alternative" => ["name" => "Neutrogena Hydro Boost", "price" => "$14.99", "fit" => 88, "saving" => "$57.01"],
-                    "reason" => "Provides similar gel-based hydration without pore-clogging heavy oils."
-                ]
             ],
-            "budget_summary" => [
-                "total_cost" => "$45.88",
-                "efficiency_score" => 92
+            'alternatives' => [
+                ['original' => ['name' => "Paula's Choice 2% BHA", 'price' => '$34.00'], 'alternative' => ['name' => 'COSRX BHA Blackhead Power Liquid', 'price' => '$16.00', 'fit' => 92, 'saving' => '$18.00'], 'reason' => 'Same active BHA at effective concentration.'],
             ],
-            "medical_disclaimer" => "This report is generated by AI based on cosmetic ingredient databases. It is not medical advice. Patch test all new products before full application."
+            'budget_summary'     => ['total_cost' => '$45.88', 'efficiency_score' => 92],
+            'medical_disclaimer' => 'This report is generated by AI based on cosmetic ingredient databases. It is not medical advice. Patch test all new products before full application.',
+        ];
+    }
+
+    private function mockIngredientScan(): array
+    {
+        return [
+            'product_name_detected' => 'Unknown Product',
+            'ingredients_raw'       => 'Demo mode — connect Vision API for real OCR.',
+            'ingredients_parsed'    => [
+                ['name' => 'Water',       'function' => 'Solvent',    'flag' => 'safe',    'reason' => 'Universal safe solvent.'],
+                ['name' => 'Niacinamide', 'function' => 'Brightening','flag' => 'safe',    'reason' => 'Great for most skin types.'],
+                ['name' => 'Alcohol',     'function' => 'Solvent',    'flag' => 'caution', 'reason' => 'May cause dryness for sensitive skin.'],
+            ],
+            'warnings'       => ['Demo mode: Connect OpenAI Vision API for real ingredient extraction.'],
+            'overall_safety' => 'caution',
+            'summary'        => 'This is a demo response. Provide OPENAI_API_KEY to enable real OCR scanning.',
         ];
     }
 }

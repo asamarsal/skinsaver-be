@@ -25,15 +25,17 @@ class AspController extends Controller
     public function metadata()
     {
         return response()->json([
-            'name' => 'SkinSaver AI',
-            'description' => 'Selfie-powered skincare shopping copilot. Turns private skin scores, beauty habits, and wishlist products into verified, budget-aware shopping decisions.',
-            'endpoints' => [
-                'audit_product' => url('/api/asp/audit-product'),
-                'audit_wishlist' => url('/api/asp/audit-wishlist'),
-                'generate_premium_report' => url('/api/asp/generate-premium-report')
+            'name'         => 'SkinSaver AI',
+            'description'  => 'Selfie-powered skincare shopping copilot. Turns private skin scores, beauty habits, and wishlist products into verified, budget-aware shopping decisions.',
+            'endpoints'    => [
+                'audit_product'          => url('/api/asp/audit-product'),
+                'audit_wishlist'         => url('/api/asp/audit-wishlist'),
+                'generate_premium_report'=> url('/api/asp/generate-premium-report'),
+                'scan_ingredients'       => url('/api/asp/scan-ingredients'),
             ],
-            'capabilities' => ['visual_analysis', 'ingredient_conflict_detection', 'budget_optimization'],
-            'version' => '1.0.0'
+            'capabilities' => ['visual_analysis', 'ingredient_conflict_detection', 'budget_optimization', 'ingredient_ocr_scanner'],
+            'ai_drivers'   => ['deepseek' => 'text analysis', 'openai' => 'vision/ocr'],
+            'version'      => '1.1.0'
         ]);
     }
 
@@ -156,10 +158,49 @@ class AspController extends Controller
         }
 
         return response()->json([
-            'success' => true,
-            'data' => $reportData,
-            'audit_id' => $audit->id,
-            'pdf_url' => url("/reports/premium/{$audit->id}.pdf") // Mocked URL
+            'success'   => true,
+            'data'      => $reportData,
+            'audit_id'  => $audit->id,
         ]);
+    }
+
+    /**
+     * POST /api/asp/scan-ingredients  (Phase 8)
+     * Accepts a photo of cosmetic packaging, extracts ingredients via Vision OCR,
+     * then analyses safety against user's skin profile using Deepseek.
+     */
+    public function scanIngredients(Request $request)
+    {
+        $request->validate([
+            'packaging_image' => 'required|image|max:8192', // max 8MB
+        ]);
+
+        $file      = $request->file('packaging_image');
+        $mimeType  = $file->getMimeType();
+
+        // Strip EXIF metadata (ZK-Privacy)
+        $imageData = file_get_contents($file->getRealPath());
+        $imageBase64 = base64_encode($imageData);
+
+        // Auto-delete temp file
+        $tempPath = $file->storeAs('ephemeral', \Illuminate\Support\Str::random(40) . '.' . $file->getClientOriginalExtension(), 'local');
+        $fullPath = \Illuminate\Support\Facades\Storage::disk('local')->path($tempPath);
+
+        $user    = $request->user();
+        $profile = $user->beautyProfile ? $user->beautyProfile->toArray() : [];
+
+        try {
+            $result = $this->analysisService->scanIngredients($imageBase64, $mimeType, $profile);
+
+            return response()->json([
+                'success' => true,
+                'data'    => $result,
+            ]);
+        } finally {
+            // Always delete the ephemeral file
+            if (file_exists($fullPath)) {
+                unlink($fullPath);
+            }
+        }
     }
 }

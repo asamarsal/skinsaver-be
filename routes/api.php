@@ -23,6 +23,9 @@ Route::middleware('auth:sanctum')->group(function () {
     // ZK-Privacy Scan Endpoints
     Route::post('/scan/selfie', [ScanController::class, 'uploadSelfie']);
 
+    // Phase 8: Ingredient OCR Scanner
+    Route::post('/asp/scan-ingredients', [AspController::class, 'scanIngredients']);
+
     // Core ASP Services
     Route::post('/asp/audit-product', [AspController::class, 'auditProduct']);
     Route::post('/asp/audit-wishlist', [AspController::class, 'auditWishlist']);
