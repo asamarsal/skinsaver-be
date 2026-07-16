@@ -15,6 +15,7 @@ return Application::configure(basePath: dirname(__DIR__))
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->alias([
             'x402.verify' => \App\Http\Middleware\X402Verify::class,
+            'okx.agent.verify' => \App\Http\Middleware\OkxAgentVerify::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

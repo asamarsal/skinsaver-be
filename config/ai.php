@@ -38,4 +38,12 @@ return [
         'model'        => env('OPENAI_MODEL', 'gpt-4o-mini'),
         'vision_model' => env('OPENAI_VISION_MODEL', 'gpt-4o'),
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | OKX.AI Configuration
+    |--------------------------------------------------------------------------
+    */
+    'okx_api_key' => env('OKX_AI_API_KEY', ''),
+    'okx_model'   => env('OKX_AI_MODEL', 'okx-ai-pro'),
 ];

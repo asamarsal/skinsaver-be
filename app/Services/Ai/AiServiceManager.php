@@ -4,6 +4,7 @@ namespace App\Services\Ai;
 
 use App\Services\Ai\Drivers\DeepseekDriver;
 use App\Services\Ai\Drivers\OpenAiDriver;
+use App\Services\Ai\Drivers\OkxAiDriver;
 use InvalidArgumentException;
 
 /**
@@ -62,6 +63,7 @@ class AiServiceManager
         return match ($name) {
             'deepseek' => new DeepseekDriver(),
             'openai'   => new OpenAiDriver(),
+            'okx_ai'   => new OkxAiDriver(),
             default    => throw new InvalidArgumentException("Unknown AI driver: [{$name}]"),
         };
     }

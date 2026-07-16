@@ -34,7 +34,21 @@ class AspController extends Controller
                 'scan_ingredients'       => url('/api/asp/scan-ingredients'),
             ],
             'capabilities' => ['visual_analysis', 'ingredient_conflict_detection', 'budget_optimization', 'ingredient_ocr_scanner'],
-            'ai_drivers'   => ['deepseek' => 'text analysis', 'openai' => 'vision/ocr'],
+            'ai_drivers'   => ['deepseek' => 'text analysis', 'openai' => 'vision/ocr', 'okx_ai' => 'native OKX.AI LLM'],
+            'task_schemas' => [
+                'audit_wishlist' => [
+                    'input'  => ['products' => 'string[]', 'budget' => 'low|medium|high', 'skin_scores' => 'object'],
+                    'output' => ['buy' => 'array', 'skip' => 'array', 'wait' => 'array', 'replace' => 'array', 'scores' => 'object', 'estimated_savings' => 'string'],
+                ],
+                'premium_report' => [
+                    'input'  => ['wishlist' => 'string[]', 'skin_scores' => 'object'],
+                    'output' => ['routine' => 'object', 'alternatives' => 'array', 'budget_summary' => 'object', 'medical_disclaimer' => 'string'],
+                ],
+                'scan_ingredients' => [
+                    'input'  => ['packaging_image' => 'base64'],
+                    'output' => ['ingredients_parsed' => 'array', 'warnings' => 'array', 'overall_safety' => 'string'],
+                ],
+            ],
             'version'      => '1.1.0'
         ]);
     }

@@ -12,6 +12,7 @@ Route::get('/user', function (Request $request) {
 
 // ASP Registration Metadata (Public)
 Route::get('/asp/metadata', [AspController::class, 'metadata']);
+Route::get('/mcp/capabilities', [\App\Http\Controllers\McpController::class, 'capabilities']);
 
 // Auth Endpoints (OKX Wallet Challenge-Response)
 Route::post('/auth/challenge', [AuthController::class, 'challenge']);
@@ -19,6 +20,10 @@ Route::post('/auth/verify', [AuthController::class, 'verify']);
 
 Route::middleware('auth:sanctum')->group(function () {
     Route::post('/auth/logout', [AuthController::class, 'logout']);
+    
+    // A2MCP Task Endpoint
+    Route::post('/mcp/task', [\App\Http\Controllers\McpController::class, 'handleTask'])
+        ->middleware('okx.agent.verify');
     
     // ZK-Privacy Scan Endpoints
     Route::post('/scan/selfie', [ScanController::class, 'uploadSelfie']);
